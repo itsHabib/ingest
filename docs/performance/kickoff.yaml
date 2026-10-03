@@ -1,0 +1,205 @@
+phase: "Performance"
+
+goal: >
+  Benchmark hot paths, run large-scale load tests, profile the system with pprof,
+  identify bottlenecks, and apply targeted optimizations.
+
+system_context: |
+  ## What we're building
+  Performance analysis and optimization for the ingestion engine. This is the final
+  phase — the system is functionally complete and tested. Now we measure, profile,
+  and optimize.
+
+  ## Why this matters
+  Profiling is a core skill for distributed systems work. You should be able to discuss:
+  - CPU and memory hotspots in the ingestion path
+  - Allocation patterns and GC pressure
+  - Contention points (mutex, channel)
+  - How batching parameters affect throughput
+  - The trade-off between latency and throughput
+
+  ## Architecture recap
+  ```
+  LoadGen → Gateway (rate limit, hash ring) → Kafka → Ingester (batch, flush) → ObjectStore
+  ```
+
+  ## Hot paths to benchmark
+  1. **Hash ring lookup** — called on every event. Must be < 1μs.
+  2. **Event serialization/deserialization** — called on every event through the pipeline.
+  3. **Batcher.Add** — called on every consumed event. Lock contention is the risk.
+  4. **Batch serialization for flush** — called per batch. JSON vs protobuf comparison.
+  5. **Gateway HTTP handler** — full request path including tenant extraction, validation, produce.
+
+  ## Existing code from Phases 1-4
+  - Full pipeline with all features
+  - Comprehensive test suite (unit, integration, chaos)
+  - Load generator
+  - Prometheus metrics and pprof endpoints on admin ports
+  - Docker Compose with full observability stack
+
+  ## Profiling approach
+  1. Run the system under load (use loadgen)
+  2. Capture CPU profile: `go tool pprof http://localhost:9100/debug/pprof/profile?seconds=30`
+  3. Capture heap profile: `go tool pprof http://localhost:9100/debug/pprof/heap`
+  4. Capture mutex profile: `go tool pprof http://localhost:9100/debug/pprof/mutex`
+  5. Analyze flame graphs, top functions, allocation sites
+  6. Apply targeted optimizations
+  7. Re-profile to verify improvement
+
+  ## Performance targets (reasonable for a single-broker setup)
+  - Gateway: > 50,000 events/sec throughput
+  - Ingester: > 30,000 events/sec processing rate
+  - Hash ring lookup: < 500ns/op
+  - Event marshal: < 1μs/op
+  - P99 gateway latency: < 10ms under load
+
+dependencies:
+  - PROJECT.md
+  - docs/foundation/kickoff.yaml
+  - docs/core-engine/kickoff.yaml
+  - docs/production/kickoff.yaml
+  - docs/quality/kickoff.yaml
+
+plans_dir: docs/performance/plans
+content_dir: docs/performance/content
+
+teammates:
+  - role: "benchmark-engineer"
+    doc: benchmark-engineer.md
+    focus: |
+      Write Go benchmarks for all hot paths and analyze allocation patterns.
+
+      1. `internal/ring/hashring_bench_test.go`:
+         - `BenchmarkRingGetPartition` — single lookup
+         - `BenchmarkRingGetPartition_Parallel` — concurrent lookups (b.RunParallel)
+         - `BenchmarkRingConstruction` — building a ring with 6 partitions, 64 vnodes
+         - Report allocations with b.ReportAllocs()
+         - Target: < 500ns/op, 0 allocs/op for lookups
+
+      2. `internal/model/serialize_bench_test.go`:
+         - `BenchmarkMarshalEvent` — single event to JSON
+         - `BenchmarkUnmarshalEvent` — JSON to single event
+         - `BenchmarkMarshalBatch_100` — batch of 100 events
+         - `BenchmarkMarshalBatch_1000` — batch of 1000 events
+         - Compare JSON sizes and marshal times at different batch sizes
+         - Report allocs — identify if json.Marshal is allocating excessively
+
+      3. `internal/ingester/batcher_bench_test.go`:
+         - `BenchmarkBatcherAdd` — single Add operation
+         - `BenchmarkBatcherAdd_Parallel` — concurrent Add from multiple goroutines
+         - `BenchmarkBatcherAdd_MultiTenant` — Add with 100 different tenants (map growth)
+         - Focus on lock contention: if parallel is much slower than serial, there's a problem
+         - Report allocs to catch unnecessary allocations per Add
+
+      4. `internal/gateway/handler_bench_test.go`:
+         - `BenchmarkHandlerPush` — full HTTP request cycle using httptest
+         - `BenchmarkHandlerPush_Parallel` — concurrent requests
+         - Use FakeProducer to isolate handler performance from Kafka
+         - Includes JSON decode, validation, tenant extraction, produce
+         - Report allocs to identify HTTP handler allocation hotspots
+
+      5. Run all benchmarks and capture baseline:
+         ```
+         go test -bench=. -benchmem -count=5 ./... | tee benchmarks/baseline.txt
+         ```
+         Create `benchmarks/` directory for storing results.
+
+  - role: "load-test-engineer"
+    doc: load-test-engineer.md
+    focus: |
+      Enhance the load generator and run systematic load tests at various scales.
+
+      1. Enhance `internal/loadgen/generator.go`:
+         - Add latency tracking with HDR histogram (or simple percentile calculation)
+         - Add configurable event payload (random bytes of specified size)
+         - Add ramp-up mode: gradually increase rate over first 10% of duration
+         - Add --output flag to write results as JSON for comparison
+         - Add warmup period (first 5s excluded from stats)
+
+      2. `internal/loadgen/report.go`:
+         - `Report` struct with:
+           - TotalEvents, SuccessEvents, FailedEvents
+           - Duration, EventsPerSec (throughput)
+           - LatencyP50, LatencyP90, LatencyP99, LatencyMax (all in ms)
+           - ErrorBreakdown map[int]int (status code → count)
+           - BytesSent int64
+         - `PrintSummary()` — human-readable table
+         - `WriteJSON(path string) error` — machine-readable for comparison
+
+      3. `configs/load-profiles/`:
+         - `baseline.yaml`: 5 tenants, 500 events/sec, 60s — baseline measurement
+         - `high-throughput.yaml`: 5 tenants, 5000 events/sec, 60s — push limits
+         - `many-tenants.yaml`: 50 tenants, 1000 events/sec, 60s — tenant cardinality
+         - `burst.yaml`: 5 tenants, ramp from 0 to 10000 events/sec, 30s — burst behavior
+         - Each is a simple YAML that the loadgen can read with --profile flag
+
+      4. `scripts/load-test.sh`:
+         - Runs each load profile sequentially
+         - Captures results to `benchmarks/load-test-<profile>-<timestamp>.json`
+         - Prints summary table at end
+
+      5. Run the load tests, capture results, identify the throughput ceiling:
+         - At what rate does p99 latency exceed 10ms?
+         - At what rate do we start seeing 429s (rate limiting)?
+         - At what rate does the ingester fall behind (Kafka lag grows)?
+
+  - role: "profiling-engineer"
+    doc: profiling-engineer.md
+    focus: |
+      Profile the running system with pprof, analyze results, and apply optimizations.
+
+      1. `scripts/profile.sh`:
+         - Start the full system (docker compose up, gateway, ingester)
+         - Start loadgen at high rate (5000 events/sec, 5 tenants, 60s)
+         - While load is running, capture profiles:
+           ```bash
+           # CPU profile (30 seconds)
+           curl -o profiles/cpu.pb.gz "http://localhost:9100/debug/pprof/profile?seconds=30"
+           curl -o profiles/cpu-ingester.pb.gz "http://localhost:9101/debug/pprof/profile?seconds=30"
+
+           # Heap profile
+           curl -o profiles/heap.pb.gz "http://localhost:9100/debug/pprof/heap"
+           curl -o profiles/heap-ingester.pb.gz "http://localhost:9101/debug/pprof/heap"
+
+           # Mutex contention
+           curl -o profiles/mutex.pb.gz "http://localhost:9100/debug/pprof/mutex"
+           curl -o profiles/mutex-ingester.pb.gz "http://localhost:9101/debug/pprof/mutex"
+
+           # Block profile (goroutine blocking)
+           curl -o profiles/block.pb.gz "http://localhost:9100/debug/pprof/block"
+           ```
+         - Create `profiles/` directory
+
+      2. `internal/observability/pprof.go` (enhance):
+         - Ensure mutex profiling is enabled: `runtime.SetMutexProfileFraction(5)`
+         - Ensure block profiling is enabled: `runtime.SetBlockProfileRate(1)`
+         - Register on admin mux: `/debug/pprof/*`
+
+      3. Analyze profiles and document findings in `docs/performance/report.md`:
+         - Top CPU consumers in gateway and ingester
+         - Top allocation sites (heap profile)
+         - Mutex contention points (where are goroutines waiting for locks?)
+         - Blocking points (channel operations, I/O waits)
+         - Flame graph observations
+
+      4. Apply targeted optimizations based on findings. Common ones to look for:
+         - **JSON encoding allocations**: switch to `json.NewEncoder` writing to a buffer pool
+           (`sync.Pool` of `bytes.Buffer`) instead of `json.Marshal`
+         - **Batcher lock contention**: if mutex is hot, consider sharding the batcher
+           by partition (one map per partition, no shared lock)
+         - **String concatenation in hash ring**: pre-compute keys or use `strings.Builder`
+         - **HTTP request body reading**: use `io.LimitReader` + buffer pool
+         - **Kafka produce allocations**: reuse `kgo.Record` structs via sync.Pool
+
+      5. Re-benchmark after optimizations:
+         ```
+         go test -bench=. -benchmem -count=5 ./... | tee benchmarks/optimized.txt
+         benchstat benchmarks/baseline.txt benchmarks/optimized.txt
+         ```
+         Use `benchstat` to show statistically significant improvements.
+
+      6. Document the optimization narrative in `docs/performance/report.md`:
+         - What the profile showed
+         - What optimization was applied
+         - Before/after numbers
+         - The narrative: "I profiled with pprof, found X, fixed it, got Y improvement"

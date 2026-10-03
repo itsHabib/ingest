@@ -1,0 +1,7 @@
+name: burst
+tenants: 5
+rate: 10000
+duration: "30s"
+payload_size: 100
+ramp_up: true
+warmup_secs: 3

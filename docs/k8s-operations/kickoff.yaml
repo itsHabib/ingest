@@ -1,0 +1,161 @@
+phase: "CI/CD & Operations"
+
+goal: >
+  CI/CD pipeline with GitHub Actions, GitOps deployment with ArgoCD,
+  alerting rules based on existing Prometheus metrics, operational runbooks,
+  and SLO definitions.
+
+system_context: |
+  ## What we're building
+  Phases 9-10 deployed the ingestion engine to Kubernetes with autoscaling,
+  tracing, and resilience. This phase adds the operational layer — how code
+  gets deployed, how incidents are detected, and how operators respond.
+
+  ## Current state
+  - All services running in K8s with HPA, PDBs, network policies
+  - Prometheus metrics on all services
+  - OpenTelemetry tracing across the pipeline
+  - Kustomize overlays for dev/staging/prod
+  - Makefile with build/test/vet targets
+
+  ## What this phase adds
+  1. **CI/CD Pipeline** — GitHub Actions workflow for build, test, lint, and
+     Docker image publishing. Runs on every PR and push to main.
+  2. **GitOps Deployment** — ArgoCD Application resources that watch the Git
+     repo and auto-sync Kustomize overlays to the cluster. Changes to
+     deploy/ trigger automatic rollouts.
+  3. **Alerting Rules** — Prometheus alerting rules based on existing metrics:
+     high error rate, high latency, Kafka lag, storage failures, rate limiting.
+  4. **Runbooks** — Operational runbooks for common incidents: high lag,
+     storage failures, rate limit storms, OOM kills, pod crash loops.
+  5. **SLO Definitions** — Service Level Objectives for the ingestion pipeline:
+     availability, latency, throughput, data loss.
+
+  ## CI/CD pipeline stages
+  ```
+  PR → lint → test → build → push image → (merge) → ArgoCD sync → rollout
+  ```
+  - Lint: go vet, golangci-lint
+  - Test: unit tests with race detector, integration tests
+  - Build: multi-stage Dockerfile, tagged by commit SHA
+  - Push: to GitHub Container Registry (ghcr.io)
+  - Deploy: ArgoCD detects new image tag, syncs to cluster
+
+  ## Alerting philosophy
+  - Alert on symptoms (high error rate), not causes (pod restarted)
+  - Page-worthy alerts only — everything else goes to a dashboard
+  - Each alert has a runbook link
+  - Use existing Prometheus metrics (no new instrumentation needed)
+
+  ## Coding conventions
+  - CI workflows in `.github/workflows/`
+  - ArgoCD resources in `deploy/argocd/`
+  - Alerting rules in `deploy/base/monitoring/alerts/`
+  - Runbooks in `docs/runbooks/`
+
+dependencies:
+  - PROJECT.md
+  - deploy/base/
+  - deploy/overlays/
+  - Dockerfile
+  - Makefile
+
+plans_dir: docs/k8s-operations/plans
+content_dir: docs/k8s-operations/content
+
+teammates:
+  - role: "cicd-engineer"
+    doc: cicd-engineer.md
+    focus: |
+      Build the CI/CD pipeline with GitHub Actions:
+
+      1. `.github/workflows/ci.yaml`:
+         - Trigger: push to main, pull_request
+         - Jobs:
+           a. `lint`: go vet, golangci-lint run
+           b. `test`: go test -race -coverprofile ./...
+           c. `build`: go build ./...
+           d. `integration-test`: docker compose up, run integration tests,
+              docker compose down (needs: [build])
+           e. `docker`: build and push Docker image (needs: [test, lint])
+         - Matrix: Go 1.22, 1.23 (or latest two versions)
+         - Caching: Go module cache, Go build cache
+         - Coverage: upload to Codecov or output as job summary
+      2. `.github/workflows/release.yaml`:
+         - Trigger: push tag v*
+         - Build multi-arch Docker image (amd64, arm64)
+         - Push to ghcr.io/<owner>/ingestion-engine:<tag>
+         - Create GitHub Release with changelog
+      3. `Dockerfile` updates (if needed):
+         - Multi-stage build: builder (Go) → runtime (distroless/static)
+         - Labels: org.opencontainers.image.* for metadata
+         - Health check: HEALTHCHECK CMD wget -q --spider http://localhost:8080/ready
+      4. `.github/dependabot.yml`:
+         - Automated dependency updates for Go modules and GitHub Actions
+
+  - role: "gitops-engineer"
+    doc: gitops-engineer.md
+    focus: |
+      Build GitOps deployment with ArgoCD:
+
+      1. `deploy/argocd/`:
+         - `project.yaml` — ArgoCD AppProject for ingestion-engine:
+           a. Source: this Git repo
+           b. Destinations: dev, staging, prod namespaces
+           c. Cluster resource whitelist
+         - `app-dev.yaml` — ArgoCD Application for dev:
+           a. Source: deploy/overlays/dev
+           b. Destination: dev cluster/namespace
+           c. Sync policy: automated (self-heal, prune)
+         - `app-staging.yaml` — ArgoCD Application for staging:
+           a. Source: deploy/overlays/staging
+           b. Destination: staging cluster/namespace
+           c. Sync policy: automated with approval
+         - `app-prod.yaml` — ArgoCD Application for prod:
+           a. Source: deploy/overlays/prod
+           b. Destination: prod cluster/namespace
+           c. Sync policy: manual (require explicit sync)
+      2. Image update strategy:
+         - `deploy/argocd/image-updater.yaml` — ArgoCD Image Updater config
+         - Watches ghcr.io for new image tags
+         - Auto-updates dev, requires approval for staging/prod
+      3. Rollback strategy:
+         - Document ArgoCD rollback commands
+         - Git revert as primary rollback mechanism
+      4. Secrets management:
+         - `deploy/base/secrets/` — ExternalSecret or SealedSecret templates
+         - Kafka credentials, S3 credentials, MinIO credentials
+         - Instructions for each secrets provider
+
+  - role: "operations-engineer"
+    doc: operations-engineer.md
+    focus: |
+      Build alerting rules, runbooks, and SLO definitions:
+
+      1. `deploy/base/monitoring/alerts/ingestion-alerts.yaml`:
+         - PrometheusRule resource with alerting rules:
+           a. IngestGatewayHighErrorRate — gateway 5xx rate > 1% for 5m
+           b. IngestGatewayHighLatency — p99 latency > 500ms for 5m
+           c. IngestKafkaLagHigh — consumer lag > 10000 for 10m
+           d. IngestStorageFlushFailures — flush failure rate > 0 for 5m
+           e. IngestRateLimitStorm — rate limit 429s > 50% of requests for 5m
+           f. IngestIngesterOOM — container restarts with OOMKilled reason
+           g. IngestPodCrashLoop — pod restart count > 3 in 15m
+         - Each alert includes: summary, description, runbook_url, severity
+      2. `docs/runbooks/`:
+         - `high-kafka-lag.md` — diagnose and resolve consumer lag
+         - `storage-failures.md` — troubleshoot storage flush errors
+         - `rate-limit-storm.md` — handle tenant rate limit storms
+         - `oom-kills.md` — diagnose and fix OOM kills
+         - `crash-loops.md` — debug pod crash loops
+         - Each runbook: symptoms, diagnosis steps, resolution, escalation
+      3. `docs/slos.md`:
+         - Availability SLO: 99.9% gateway uptime (measured by successful responses)
+         - Latency SLO: p99 < 100ms for push requests
+         - Throughput SLO: sustain 50k events/sec per gateway replica
+         - Data loss SLO: 0% event loss (at-least-once delivery)
+         - Freshness SLO: events queryable within 30s of push
+         - Error budget calculations and burn rate alerts
+      4. `deploy/base/monitoring/dashboards/slo-dashboard.json`:
+         - Grafana dashboard showing SLO compliance
+         - Error budget remaining, burn rate, availability over time

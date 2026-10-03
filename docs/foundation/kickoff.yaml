@@ -1,0 +1,146 @@
+phase: "Foundation"
+
+goal: >
+  Runnable gateway that accepts multi-tenant HTTP push requests, validates them,
+  and produces events to Kafka. Includes Docker Compose infrastructure, Go module,
+  cobra CLI skeleton, and core data types.
+
+system_context: |
+  ## What we're building
+  A multi-tenant distributed ingestion service in Go that uses Kafka as the
+  durability layer instead of a traditional WAL. This makes
+  ingesters stateless — Kafka owns durability, ingesters are just consumers that
+  batch and flush to object storage.
+
+  ## Architecture (full pipeline — this phase builds the left half)
+  ```
+  Client → Gateway (HTTP) → Kafka (KRaft) → Ingester → Object Storage
+  ```
+
+  This phase builds: Go module, Docker Compose (Kafka), core types, and the Gateway.
+
+  ## Key design decisions
+  - Tenant ID comes from `X-Scope-OrgID` HTTP header
+  - Events are generic JSON objects with tenant_id, timestamp, labels, value, and
+    optional payload bytes (for future pprof support)
+  - Gateway is stateless — validates, then produces to Kafka
+  - Use `franz-go` for Kafka (pure Go, best ergonomics, used in production systems)
+  - Use `cobra` for CLI (consistent with our other Go tools)
+  - Use `log/slog` for structured logging (stdlib, Go 1.21+)
+  - Kafka runs in KRaft mode (no Zookeeper dependency), 6 partitions, single broker
+
+  ## Coding conventions
+  - Standard Go project layout: `cmd/` for commands, `internal/` for packages
+  - All packages get `_test.go` files with at minimum a basic smoke test
+  - Use `context.Context` throughout for cancellation/timeout propagation
+  - Errors wrap with `fmt.Errorf("thing: %w", err)` for stack context
+  - Config uses a struct with functional options or simple flags — no heavy frameworks
+  - HTTP handlers return proper status codes: 200 OK, 400 bad request, 429 rate limited, 503 unavailable
+
+  ## Event data model
+  ```go
+  type Event struct {
+      TenantID  string            `json:"tenant_id"`
+      Timestamp time.Time         `json:"timestamp"`
+      Labels    map[string]string `json:"labels"`
+      Value     float64           `json:"value"`
+      Payload   []byte            `json:"payload,omitempty"`
+  }
+  ```
+
+  ## Kafka topic
+  - Topic name: `ingestion-events`
+  - Kafka auto-creates topics, but we use 6 partitions (configured in docker-compose)
+  - Messages are keyed by tenant ID (partition routing will be refined in Phase 2 with hash ring)
+
+  ## Verification
+  After this phase, you should be able to:
+  ```bash
+  docker compose up -d                    # start Kafka
+  go run . gateway --port 8080            # start gateway
+  curl -X POST localhost:8080/api/v1/push \
+    -H "X-Scope-OrgID: tenant-a" \
+    -H "Content-Type: application/json" \
+    -d '[{"labels":{"service":"api"},"value":42.0}]'
+  # Verify message appears in Kafka via kcat or redpanda console
+  ```
+
+dependencies:
+  - PROJECT.md
+
+plans_dir: docs/foundation/plans
+content_dir: docs/foundation/content
+
+teammates:
+  - role: "infra-engineer"
+    doc: infra-engineer.md
+    focus: |
+      Set up the project infrastructure:
+
+      1. `go.mod` — module `github.com/itsHabib/ingest`, Go 1.22+
+      2. `main.go` — thin entry point, calls `cmd.Execute()`
+      3. `cmd/root.go` — cobra root command with global flags (--log-level, --config)
+      4. `internal/config/config.go` — Config struct with fields for:
+         - Gateway: port, kafka brokers, kafka topic
+         - Ingester: kafka brokers, kafka topic, consumer group, batch size, batch age, storage path
+         - Parsed from flags and env vars (INGEST_GATEWAY_PORT, INGEST_KAFKA_BROKERS, etc.)
+      5. `docker-compose.yml` — Kafka in KRaft mode:
+         - Use `bitnami/kafka:3.7` image
+         - KRaft mode (no Zookeeper): KAFKA_CFG_PROCESS_ROLES=controller,broker
+         - 6 partitions default
+         - Expose port 9092
+         - Include Redpanda Console on port 8888 for visual debugging (optional but nice)
+      6. `Makefile` with targets: build, test, vet, lint, docker-up, docker-down, run-gateway, run-ingester
+
+  - role: "model-engineer"
+    doc: model-engineer.md
+    focus: |
+      Build the core data types and tenant extraction:
+
+      1. `internal/model/event.go`:
+         - `Event` struct: TenantID, Timestamp, Labels (map[string]string), Value (float64), Payload ([]byte)
+         - `Batch` struct: TenantID, Partition (int32), Events ([]Event), CreatedAt, SizeBytes
+         - Constructor functions: `NewEvent()`, `NewBatch()`
+         - `Event.Validate()` method — checks non-empty tenant, valid timestamp, non-empty labels
+         - `Batch.Add(event)` — appends event, updates SizeBytes
+      2. `internal/model/serialize.go`:
+         - `MarshalEvents([]Event) ([]byte, error)` — JSON marshal
+         - `UnmarshalEvents([]byte) ([]Event, error)` — JSON unmarshal
+         - `MarshalBatch(Batch) ([]byte, error)` — JSON marshal
+         - `UnmarshalBatch([]byte) (Batch, error)` — JSON unmarshal
+      3. `internal/tenant/tenant.go`:
+         - `ExtractTenantID(r *http.Request) (string, error)` — reads X-Scope-OrgID header
+         - Context helpers: `ContextWithTenantID(ctx, tenantID)`, `TenantIDFromContext(ctx)`
+         - Uses a private context key type to avoid collisions
+      4. Unit tests for all of the above
+
+  - role: "gateway-engineer"
+    doc: gateway-engineer.md
+    focus: |
+      Build the HTTP gateway and Kafka producer:
+
+      1. `internal/gateway/producer.go`:
+         - `Producer` struct wrapping `franz-go` client
+         - `NewProducer(brokers []string, topic string) (*Producer, error)`
+         - `Produce(ctx context.Context, key []byte, value []byte) error` — sync produce
+         - `ProduceAsync(ctx context.Context, key []byte, value []byte, callback func(error))` — async
+         - `Close() error` — graceful shutdown, flush pending
+         - Add tenant ID as Kafka record header
+      2. `internal/gateway/handler.go`:
+         - `Handler` struct with producer and config dependencies
+         - `NewHandler(producer *Producer, cfg config.GatewayConfig) *Handler`
+         - `ServeHTTP(w, r)` for `POST /api/v1/push`:
+           a. Extract tenant ID via tenant.ExtractTenantID (return 400 if missing)
+           b. Read and validate request body (max body size check)
+           c. Unmarshal JSON array of events
+           d. Validate each event
+           e. Set TenantID on each event from header (don't trust client-provided tenant_id)
+           f. Marshal and produce to Kafka with tenant ID as key
+           g. Return 200 with `{"status": "ok", "events_accepted": N}`
+         - Health endpoint: `GET /ready` returns 200
+      3. `cmd/gateway.go`:
+         - Cobra `gateway` subcommand
+         - Flags: --port (default 8080), --kafka-brokers (default localhost:9092), --kafka-topic (default ingestion-events)
+         - Wires up config → producer → handler → http.Server
+         - Graceful shutdown on SIGINT/SIGTERM: drain producer, stop server
+      4. Unit tests with httptest for handler (mock producer)

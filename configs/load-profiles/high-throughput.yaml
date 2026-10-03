@@ -1,0 +1,7 @@
+name: high-throughput
+tenants: 5
+rate: 5000
+duration: "60s"
+payload_size: 100
+ramp_up: false
+warmup_secs: 5

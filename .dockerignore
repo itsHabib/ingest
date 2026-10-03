@@ -1,0 +1,12 @@
+.git
+.claude
+bin
+data
+profiles
+benchmarks
+.env
+.env.*
+*.pem
+*.key
+credentials*
+secrets

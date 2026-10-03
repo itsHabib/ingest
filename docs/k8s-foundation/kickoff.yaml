@@ -1,0 +1,154 @@
+phase: "Kubernetes Foundation"
+
+goal: >
+  Kubernetes manifests for all services, 3-broker Kafka cluster with replication,
+  and Kustomize overlays for dev/staging/prod environments.
+
+system_context: |
+  ## What we're building
+  The ingestion engine currently runs via Docker Compose for local development.
+  This phase moves to Kubernetes for production deployment. We need manifests for
+  every service (gateway, ingester, querier, compactor), a proper multi-broker
+  Kafka cluster, and environment-specific configuration via Kustomize.
+
+  ## Current Docker Compose setup
+  - Single Kafka broker (KRaft mode, 6 partitions)
+  - MinIO (S3-compatible object storage)
+  - Prometheus + Grafana for monitoring
+  - Redpanda Console for Kafka debugging
+  - All services on a single Docker network
+
+  ## What needs to change for K8s
+  1. **Service manifests** — Deployments, Services, ConfigMaps, and
+     ServiceAccounts for gateway, ingester, querier, and compactor
+  2. **Kafka cluster** — 3 brokers with replication factor 3 for durability.
+     Use Strimzi operator or StatefulSet with persistent volumes.
+  3. **Kustomize overlays** — Base manifests + overlays for dev (minikube,
+     single replica), staging (3 replicas, resource limits), and prod
+     (HPA, PDB, anti-affinity — prepared for Phase 10)
+  4. **Supporting infra** — MinIO (or real S3 in prod), Prometheus operator
+     ServiceMonitors, namespace isolation
+
+  ## Architecture in K8s
+  ```
+  Namespace: ingestion-engine
+  ├── gateway (Deployment, 2+ replicas, Service type LoadBalancer)
+  ├── ingester (Deployment, 3+ replicas, no Service — internal consumer)
+  ├── querier (Deployment, 2+ replicas, Service type ClusterIP)
+  ├── compactor (Deployment, 1 replica — single writer)
+  ├── kafka (StatefulSet, 3 brokers, PersistentVolumeClaims)
+  ├── minio (StatefulSet, 1 replica, PVC)
+  └── monitoring (Prometheus ServiceMonitor, Grafana)
+  ```
+
+  ## Key design decisions
+  - Kustomize (not Helm) — simpler, built into kubectl, sufficient for our needs
+  - Strimzi Kafka operator preferred (manages brokers, topics, users)
+  - Environment variables for config (same as Docker Compose, via ConfigMaps)
+  - Liveness/readiness probes use existing /ready endpoints
+  - Resource requests/limits set per environment overlay
+
+  ## Coding conventions
+  - Manifests in `deploy/` directory (not mixed with app code)
+  - One YAML file per resource, named `<resource-kind>-<name>.yaml`
+  - Kustomize base + overlays pattern
+  - All manifests validated with `kubectl --dry-run=client`
+
+dependencies:
+  - PROJECT.md
+  - Dockerfile
+  - docker-compose.yml
+
+plans_dir: docs/k8s-foundation/plans
+content_dir: docs/k8s-foundation/content
+
+teammates:
+  - role: "k8s-manifest-engineer"
+    doc: k8s-manifest-engineer.md
+    focus: |
+      Build Kubernetes manifests for all application services:
+
+      1. `deploy/base/` — Base manifests:
+         - `namespace.yaml` — ingestion-engine namespace
+         - `gateway/deployment.yaml` — Gateway Deployment (2 replicas default)
+         - `gateway/service.yaml` — LoadBalancer Service on port 8080
+         - `gateway/configmap.yaml` — Environment config (Kafka brokers, topic, rate limits)
+         - `gateway/serviceaccount.yaml`
+         - `ingester/deployment.yaml` — Ingester Deployment (3 replicas default)
+         - `ingester/configmap.yaml` — Consumer group, batch config, storage backend
+         - `ingester/serviceaccount.yaml`
+         - `querier/deployment.yaml` — Querier Deployment (2 replicas default)
+         - `querier/service.yaml` — ClusterIP Service on port 8082
+         - `querier/configmap.yaml` — Storage backend, cache config
+         - `querier/serviceaccount.yaml`
+         - `compactor/deployment.yaml` — Compactor Deployment (1 replica)
+         - `compactor/configmap.yaml` — Compaction interval, thresholds
+         - `compactor/serviceaccount.yaml`
+      2. All Deployments include:
+         - Liveness probe: HTTP GET /ready
+         - Readiness probe: HTTP GET /ready
+         - Resource requests and limits (overridden per overlay)
+         - Anti-affinity hints (preferredDuringScheduling)
+      3. `deploy/base/kustomization.yaml` — lists all base resources
+      4. Unit test: `kubectl apply --dry-run=client -k deploy/base/`
+
+  - role: "kafka-cluster-engineer"
+    doc: kafka-cluster-engineer.md
+    focus: |
+      Build the 3-broker Kafka cluster for Kubernetes:
+
+      1. `deploy/base/kafka/` — Strimzi-based Kafka cluster:
+         - `strimzi-subscription.yaml` — Strimzi operator subscription (or
+           instructions for installing via kubectl apply)
+         - `kafka-cluster.yaml` — Strimzi Kafka resource:
+           a. 3 brokers (replicas: 3)
+           b. KRaft mode (no Zookeeper)
+           c. Replication factor 3 for durability
+           d. 6 partitions default
+           e. Persistent storage (100Gi per broker)
+           f. JVM heap: 1Gi (dev), 4Gi (prod)
+           g. Metrics: JMX exporter for Prometheus
+         - `kafka-topic.yaml` — Strimzi KafkaTopic for ingestion-events
+           (6 partitions, replication factor 3)
+         - `kafka-user.yaml` — Strimzi KafkaUser for the ingestion service
+           (optional, for auth)
+      2. Alternative: if Strimzi is too heavy, provide a StatefulSet-based
+         Kafka deployment:
+         - `kafka-statefulset.yaml` — 3 replicas, PVCs, KRaft config
+         - `kafka-service.yaml` — Headless service for broker discovery
+         - `kafka-configmap.yaml` — Kafka configuration
+      3. Connection config: update gateway/ingester ConfigMaps to point to
+         the K8s Kafka service (kafka-cluster-kafka-bootstrap:9092)
+      4. Validation: provide a test job that produces and consumes a message
+
+  - role: "config-engineer"
+    doc: config-engineer.md
+    focus: |
+      Build Kustomize overlays for dev/staging/prod:
+
+      1. `deploy/overlays/dev/kustomization.yaml`:
+         - Single replica for all services
+         - Minimal resource limits (100m CPU, 128Mi memory)
+         - Kafka: 1 broker (override), ephemeral storage
+         - MinIO: single replica, ephemeral
+         - NodePort services for local access
+      2. `deploy/overlays/staging/kustomization.yaml`:
+         - 2 replicas gateway/querier, 3 replicas ingester
+         - Moderate resource limits (500m CPU, 512Mi memory)
+         - Kafka: 3 brokers, 50Gi persistent storage
+         - Real resource requests/limits
+      3. `deploy/overlays/prod/kustomization.yaml`:
+         - 3+ replicas all services
+         - Production resource limits (1 CPU, 1Gi memory)
+         - Kafka: 3 brokers, 100Gi persistent storage
+         - PodDisruptionBudgets (placeholder for Phase 10)
+         - Anti-affinity rules (placeholder for Phase 10)
+      4. `deploy/base/minio/` — MinIO StatefulSet:
+         - StatefulSet with PVC
+         - Secret for credentials
+         - Service on port 9000
+      5. `deploy/base/monitoring/` — Prometheus integration:
+         - ServiceMonitor resources for gateway, ingester, querier
+         - Grafana dashboard ConfigMap (import existing dashboard)
+      6. Validation: `kubectl apply --dry-run=client -k deploy/overlays/dev/`
+         for all three overlays

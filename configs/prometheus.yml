@@ -1,0 +1,22 @@
+global:
+  scrape_interval: 5s
+  evaluation_interval: 5s
+
+scrape_configs:
+  - job_name: "gateway"
+    static_configs:
+      - targets: ["gateway:9100"]
+        labels:
+          component: "gateway"
+
+  - job_name: "ingester"
+    static_configs:
+      - targets: ["ingester:9101"]
+        labels:
+          component: "ingester"
+
+  - job_name: "querier"
+    static_configs:
+      - targets: ["querier:9102"]
+        labels:
+          component: "querier"

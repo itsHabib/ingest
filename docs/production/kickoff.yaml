@@ -1,0 +1,243 @@
+phase: "Production"
+
+goal: >
+  Add per-tenant rate limiting, backpressure propagation, Prometheus metrics,
+  Grafana dashboard, load generator, and S3/MinIO storage backend.
+
+system_context: |
+  ## What we're building
+  Production-readiness features for the ingestion pipeline. After Phase 1 (gateway)
+  and Phase 2 (hash ring + ingester + storage), we have a working pipeline. This phase
+  adds the features that make it production-grade and observable.
+
+  ## Architecture (complete)
+  ```
+  Client/LoadGen
+    |
+    v
+  Gateway (HTTP)
+    - tenant auth (X-Scope-OrgID)
+    - rate limit (per-tenant token bucket) ← NEW
+    - hash ring → partition
+    - metrics ← NEW
+    |
+    v
+  Kafka (KRaft)
+    |
+    v
+  Ingester (stateless)
+    - consumer group
+    - batcher
+    - flusher → ObjectStore
+    - metrics ← NEW
+    - backpressure (pause on storage failure) ← NEW
+    |
+    v
+  ObjectStore
+    - filesystem (existing)
+    - S3/MinIO ← NEW
+  ```
+
+  ## Existing code from Phase 1 + 2
+  - Full gateway with HTTP handler, Kafka producer, hash ring routing
+  - Stateless ingester with consumer, batcher, flusher
+  - ObjectStore interface with filesystem backend
+  - Core model types, tenant extraction, config, CLI
+
+  ## Rate Limiting Design
+  Grafana uses per-tenant rate limiting with configurable `ingestion_rate` and
+  `ingestion_burst_size` per tenant. We mirror this:
+  - Default rate: 1000 events/sec per tenant
+  - Default burst: 5000 events
+  - Uses `golang.org/x/time/rate` (token bucket algorithm)
+  - Lazy init: create limiter on first request for a tenant
+  - Returns HTTP 429 Too Many Requests with Retry-After header
+
+  ## Backpressure Chain
+  The full backpressure propagation path:
+  ```
+  Storage slow/down → Flusher fails → Ingester pauses Kafka consumption →
+  Kafka consumer lag grows → (no direct backpressure to gateway, but lag is observable) →
+  If Kafka produce times out → Gateway returns 503
+  ```
+  - Ingester: if flush fails after all retries, pause consumption (franz-go PauseFetchTopics)
+  - Gateway: if Kafka produce times out (>5s), return 503 Service Unavailable
+  - This creates natural backpressure without explicit coordination
+
+  ## Metrics Design (Prometheus)
+  Follow standard naming conventions:
+  - Gateway: `ingest_gateway_requests_total{tenant,status}`, `ingest_gateway_request_duration_seconds{tenant}`,
+    `ingest_gateway_events_produced_total{tenant,partition}`, `ingest_gateway_rate_limited_total{tenant}`
+  - Ingester: `ingest_ingester_events_consumed_total{partition}`, `ingest_ingester_batch_flush_total{tenant,status}`,
+    `ingest_ingester_batch_flush_duration_seconds{tenant}`, `ingest_ingester_batch_size_events`,
+    `ingest_ingester_kafka_lag{partition}`
+
+  ## MinIO/S3 Setup
+  - MinIO runs in Docker Compose, S3-compatible API on port 9000, console on 9001
+  - Bucket: `ingestion-engine`
+  - Use aws-sdk-go-v2 with custom endpoint pointing to MinIO
+  - Same ObjectStore interface, just a different implementation
+
+  ## Load Generator Design
+  - Cobra subcommand: `go run . loadgen`
+  - Configurable: --tenants (default 5), --rate (events/sec total, default 500),
+    --duration (default 60s), --payload-size (bytes, default 100)
+  - Round-robin or weighted distribution across tenants
+  - Reports: total events sent, errors, throughput, p50/p99 latency
+
+dependencies:
+  - PROJECT.md
+  - docs/foundation/kickoff.yaml
+  - docs/core-engine/kickoff.yaml
+
+plans_dir: docs/production/plans
+content_dir: docs/production/content
+
+teammates:
+  - role: "tenancy-engineer"
+    doc: tenancy-engineer.md
+    focus: |
+      Build per-tenant rate limiting and backpressure propagation.
+
+      1. `internal/tenant/ratelimit.go`:
+         - `RateLimiter` struct:
+           - mu sync.RWMutex
+           - limiters map[string]*rate.Limiter
+           - defaultRate float64 (events/sec)
+           - defaultBurst int
+         - `NewRateLimiter(defaultRate float64, defaultBurst int) *RateLimiter`
+         - `Allow(tenantID string) bool`:
+           a. RLock, check if limiter exists
+           b. If not, upgrade to write lock, create with rate.NewLimiter
+           c. Return limiter.Allow()
+         - `WaitN(ctx context.Context, tenantID string, n int) error`:
+           For batch requests — waits until tokens available or ctx cancelled
+         - `SetTenantLimit(tenantID string, r float64, burst int)`:
+           Override default for a specific tenant
+
+      2. `internal/tenant/ratelimit_test.go`:
+         - Test basic allow/deny at rate boundary
+         - Test per-tenant isolation (tenant-a rate limited, tenant-b unaffected)
+         - Test burst behavior
+         - Test concurrent access (multiple goroutines for same tenant)
+         - Test custom per-tenant override
+
+      3. Integrate into gateway handler:
+         - Add RateLimiter as dependency to Handler
+         - Check `rateLimiter.Allow(tenantID)` before producing
+         - If denied: return 429 with JSON body `{"error": "rate limit exceeded", "tenant": "..."}`
+           and `Retry-After: 1` header
+
+      4. Backpressure in ingester:
+         - Update `internal/ingester/consumer.go`:
+           - If flusher returns error after all retries, call `client.PauseFetchTopics("ingestion-events")`
+           - Start a background probe: every 5s, try a test write to storage
+           - When probe succeeds, call `client.ResumeFetchTopics("ingestion-events")`
+           - Log clearly when pausing/resuming
+         - Update gateway producer:
+           - Set produce timeout to 5 seconds
+           - If produce fails/times out, return HTTP 503 with JSON body
+
+  - role: "observability-engineer"
+    doc: observability-engineer.md
+    focus: |
+      Add Prometheus metrics to all components and set up Grafana dashboard.
+
+      1. `internal/observability/metrics.go`:
+         - Define all metrics as package-level vars using promauto:
+           ```
+           Gateway:
+           - RequestsTotal *prometheus.CounterVec (tenant, status_code)
+           - RequestDuration *prometheus.HistogramVec (tenant)
+           - EventsProducedTotal *prometheus.CounterVec (tenant, partition)
+           - RateLimitedTotal *prometheus.CounterVec (tenant)
+
+           Ingester:
+           - EventsConsumedTotal *prometheus.CounterVec (partition)
+           - BatchFlushTotal *prometheus.CounterVec (tenant, status)
+           - BatchFlushDuration *prometheus.HistogramVec (tenant)
+           - BatchSizeEvents prometheus.Histogram
+           - KafkaLag *prometheus.GaugeVec (partition)
+           ```
+         - Use `promauto.NewCounterVec` etc. for auto-registration
+         - Histogram buckets for durations: .001, .005, .01, .025, .05, .1, .25, .5, 1, 2.5, 5, 10
+
+      2. `internal/observability/middleware.go`:
+         - HTTP middleware that wraps handlers to record RequestsTotal and RequestDuration
+         - `InstrumentHandler(name string, next http.Handler) http.Handler`
+         - Uses a `responseWriter` wrapper to capture status code
+
+      3. `internal/observability/pprof.go`:
+         - Helper to register `net/http/pprof` handlers on a separate mux
+         - `RegisterPprof(mux *http.ServeMux)` — registers /debug/pprof/*
+         - Both gateway and ingester should expose pprof on a separate admin port
+
+      4. Instrument existing code:
+         - Gateway handler: increment RequestsTotal, observe RequestDuration, increment EventsProducedTotal
+         - Rate limiter: increment RateLimitedTotal
+         - Ingester consumer: increment EventsConsumedTotal
+         - Flusher: increment BatchFlushTotal (success/error), observe BatchFlushDuration, observe BatchSizeEvents
+         - Expose /metrics endpoint on both gateway and ingester (separate admin port, default 9100/9101)
+
+      5. Update `docker-compose.yml` to add:
+         - Prometheus (port 9090) with scrape config for gateway and ingester
+         - Grafana (port 3000) with anonymous auth enabled
+
+      6. `configs/prometheus.yml`:
+         - Scrape gateway at localhost:9100/metrics every 5s
+         - Scrape ingester at localhost:9101/metrics every 5s
+
+      7. `configs/grafana/provisioning/datasources/prometheus.yml`:
+         - Auto-provision Prometheus datasource pointing to http://prometheus:9090
+
+      8. `configs/grafana/provisioning/dashboards/dashboard.yml` + `ingestion.json`:
+         - Dashboard with panels: request rate, error rate, events/sec by tenant,
+           batch flush rate, flush duration p99, Kafka consumer lag, rate limiting events
+
+  - role: "integration-engineer"
+    doc: integration-engineer.md
+    focus: |
+      Build the load generator and S3/MinIO storage backend.
+
+      1. `internal/storage/s3.go`:
+         - `S3Store` struct with s3.Client and bucket name
+         - `NewS3Store(endpoint, bucket, accessKey, secretKey, region string, usePathStyle bool) (*S3Store, error)`:
+           a. Create aws config with custom endpoint resolver (for MinIO)
+           b. Create s3 client with `UsePathStyle: true` (required for MinIO)
+           c. Check if bucket exists, create if not
+         - Implement full ObjectStore interface:
+           - Put: s3.PutObject with bytes.NewReader
+           - Get: s3.GetObject, read body
+           - List: s3.ListObjectsV2 with prefix
+           - Delete: s3.DeleteObject
+           - Exists: s3.HeadObject
+         - Add `Content-Type: application/json` to Put
+
+      2. Update `docker-compose.yml` to add MinIO:
+         ```yaml
+         minio:
+           image: minio/minio:latest
+           command: server /data --console-address ":9001"
+           ports: ["9000:9000", "9001:9001"]
+           environment:
+             MINIO_ROOT_USER: minioadmin
+             MINIO_ROOT_PASSWORD: minioadmin
+         ```
+
+      3. Update `internal/config/config.go`:
+         - Add StorageBackend field: "filesystem" or "s3"
+         - Add S3 config: endpoint, bucket, access key, secret key, region
+         - CLI flags: --storage-backend, --s3-endpoint, --s3-bucket, etc.
+
+      4. `cmd/loadgen.go` + `internal/loadgen/generator.go`:
+         - `Generator` struct: targetURL, tenants []string, rate float64, duration time.Duration
+         - `NewGenerator(cfg LoadGenConfig) *Generator`
+         - `Run(ctx context.Context) (*Report, error)`:
+           a. Create N goroutines (one per tenant or use worker pool)
+           b. Use rate.Limiter to control overall event rate
+           c. Generate random events with realistic labels
+           d. POST to gateway, record latency and errors
+           e. Return Report with stats
+         - `Report` struct: TotalEvents, Errors, Duration, Throughput, P50/P99 latency
+         - Cobra command with flags: --target (gateway URL), --tenants, --rate, --duration, --payload-size
+         - Print live progress every 5s and final summary

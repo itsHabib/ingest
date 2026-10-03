@@ -1,0 +1,150 @@
+phase: "Query Performance"
+
+goal: >
+  Query planner for intelligent block pruning, parallel fan-out execution engine,
+  and comprehensive read-path benchmarks and load testing.
+
+system_context: |
+  ## What we're building
+  Phases 6-7 built the query path: block index, HTTP query API, parallel block
+  reader, compaction, structured block format, and block cache. The query path
+  works but lacks optimization — every query reads all matching blocks
+  sequentially, there's no query planning, and we have no read-path benchmarks.
+
+  ## The solution (this phase)
+  1. **Query Planner** — Analyzes the query (time range, label matchers) and the
+     block index to produce an optimized execution plan. Prunes blocks by time
+     range and label set, estimates cost, and decides parallelism level.
+  2. **Fan-out Executor** — Executes the query plan with parallel block reads,
+     streaming merge, and early termination. Supports limit/offset for pagination.
+  3. **Read-path Benchmarks** — Go benchmarks for hot paths (index lookup, block
+     reading, merge, cache) and load testing for the full query API.
+
+  ## Query planning strategy
+  - Time pruning: skip blocks whose [minTime, maxTime] doesn't overlap the query range
+  - Label pruning: skip blocks that can't contain matching labels (using block header label summary)
+  - Cost estimation: estimate total bytes to read, use for concurrency decisions
+  - Partition fan-out: read different partitions in parallel
+
+  ## Execution model
+  ```
+  Query → Planner → ExecutionPlan → Executor
+                                       ├─ Partition 0: [block1, block2] → worker
+                                       ├─ Partition 1: [block3]         → worker
+                                       └─ Partition 5: [block4, block5] → worker
+                                                                            ↓
+                                                                    streaming merge
+                                                                            ↓
+                                                                    HTTP response
+  ```
+
+  ## Performance targets
+  - Index lookup: < 1ms for 1000 blocks
+  - Block read (cached): < 100μs
+  - Block read (uncached, filesystem): < 5ms
+  - Query latency (100 blocks, cached): < 50ms
+  - Query throughput: > 100 concurrent queries
+
+  ## Coding conventions
+  - Follow existing patterns (internal/, cmd/, _test.go)
+  - Benchmarks use Go's testing.B framework
+  - Load tests use the existing load profile YAML format
+
+dependencies:
+  - PROJECT.md
+  - internal/index/index.go
+  - internal/querier/handler.go
+  - internal/querier/reader.go
+  - internal/cache/lru.go
+  - internal/block/format.go
+
+plans_dir: docs/query-performance/plans
+content_dir: docs/query-performance/content
+
+teammates:
+  - role: "query-planner-engineer"
+    doc: query-planner-engineer.md
+    focus: |
+      Build the query planner and optimizer:
+
+      1. `internal/querier/planner.go`:
+         - `QueryPlan` struct: Partitions []PartitionPlan, EstimatedBytes int64,
+           EstimatedBlocks int, Concurrency int
+         - `PartitionPlan` struct: Partition int32, Blocks []BlockMeta,
+           EstimatedBytes int64
+         - `Planner` struct with IndexStore and config
+         - `NewPlanner(indexStore IndexStore, cfg PlannerConfig) *Planner`
+         - `Plan(ctx context.Context, query Query) (*QueryPlan, error)`:
+           a. Enumerate dates in query time range
+           b. Read block indexes for each date
+           c. Time pruning: skip blocks outside query time range
+           d. Label pruning: skip blocks that can't match label matchers
+           e. Group remaining blocks by partition
+           f. Estimate total bytes and decide concurrency level
+      2. `internal/querier/query.go`:
+         - `Query` struct: TenantID, Start, End, Matchers []LabelMatcher,
+           Limit, Offset int
+         - `ParseQuery(r *http.Request) (Query, error)` — parse from HTTP request
+         - `Validate() error` — check invariants
+      3. `internal/querier/optimizer.go`:
+         - `OptimizePlan(plan *QueryPlan) *QueryPlan`:
+           a. Sort blocks within each partition by time (earliest first)
+           b. Merge adjacent small blocks into read groups
+           c. Adjust concurrency based on estimated cost
+           d. Apply limit pushdown (skip partitions if limit already reached)
+      4. Unit tests: time pruning, label pruning, cost estimation, optimization
+
+  - role: "fanout-engineer"
+    doc: fanout-engineer.md
+    focus: |
+      Build the parallel fan-out execution engine:
+
+      1. `internal/querier/executor.go`:
+         - `Executor` struct with BlockReader, Cache, config
+         - `NewExecutor(reader *BlockReader, cfg ExecutorConfig) *Executor`
+         - `Execute(ctx context.Context, plan *QueryPlan) (*ResultSet, error)`:
+           a. Launch one goroutine per partition plan
+           b. Each goroutine reads its blocks via BlockReader
+           c. Results flow into per-partition channels
+           d. Streaming k-way merge across partition channels
+           e. Apply limit/offset to merged stream
+           f. Context cancellation stops all workers
+         - `ResultSet` struct: Events <-chan Event, Errors <-chan error,
+           Stats ExecutionStats
+         - `ExecutionStats`: BlocksRead, BytesRead, EventsMatched,
+           CacheHits, CacheMisses, Duration
+      2. `internal/querier/limiter.go`:
+         - `RateLimitedExecutor` wrapping Executor with per-tenant query rate limits
+         - Prevents single tenant from consuming all query resources
+         - Returns 429 when query rate exceeded
+      3. Update querier handler to use Planner → Executor pipeline instead of
+         direct block reading
+      4. Unit tests: fan-out correctness, cancellation, limit/offset,
+         rate limiting, stats accuracy
+
+  - role: "query-bench-engineer"
+    doc: query-bench-engineer.md
+    focus: |
+      Build read-path benchmarks and load testing:
+
+      1. `internal/querier/bench_test.go`:
+         - BenchmarkIndexLookup — 100, 1000, 10000 blocks
+         - BenchmarkBlockReadCached — various block sizes
+         - BenchmarkBlockReadUncached — filesystem reads
+         - BenchmarkMergeStreams — 2, 4, 8, 16 streams
+         - BenchmarkQueryEndToEnd — full query pipeline
+      2. `internal/index/bench_test.go`:
+         - BenchmarkIndexWrite — writing indexes
+         - BenchmarkIndexLookupByTime — time range filtering
+         - BenchmarkIndexLookupByLabel — label matching
+      3. `configs/load-profiles/query-baseline.yaml`:
+         - Query load profile: concurrent query workers, time range distribution,
+           label selectivity, target QPS
+      4. `scripts/query-load-test.sh`:
+         - Script that generates test data (via loadgen), then runs concurrent
+           queries against the query API
+         - Reports: query latency (p50, p95, p99), throughput, error rate
+         - Profiles: CPU and memory under query load
+      5. `internal/querier/profile_test.go`:
+         - TestProfileQueryPath — generates pprof profiles under synthetic
+           query load for bottleneck analysis

@@ -1,0 +1,146 @@
+phase: "Compaction & Caching"
+
+goal: >
+  Background compactor to merge small blocks into larger ones, structured block
+  format with headers for efficient partial reads, and LRU block cache for
+  read performance.
+
+system_context: |
+  ## What we're building
+  Phase 6 (Query Foundation) added the read path with block indexes and parallel
+  readers. However, the ingester flushes batches frequently (every 1000 events
+  or 10 seconds), producing many small block files. This creates two problems:
+  1. **Too many small files** — listing and reading hundreds of tiny blocks per
+     query is slow and expensive (especially on S3 where each GET is an API call)
+  2. **No block-level metadata** — the current format is raw JSON arrays, so you
+     must deserialize the entire block to check time ranges or event counts
+
+  ## The solution (this phase)
+  1. **Compactor** — Background process that periodically scans for small blocks,
+     merges them into larger ones (target: 64MB), updates the block index, and
+     deletes the originals. Runs as a new CLI command (`go run . compactor`).
+  2. **Structured Block Format** — Replace raw JSON arrays with a block format
+     that has a header (min/max time, event count, label summary, size) followed
+     by the data. Enables the querier to read just the header for filtering
+     without deserializing the full block.
+  3. **Block Cache** — LRU cache that keeps recently-read blocks in memory.
+     Dramatically reduces storage reads for repeated or overlapping queries.
+
+  ## Compaction strategy
+  - Scan one tenant+date at a time
+  - Group small blocks (< 4MB) by partition
+  - Merge groups into target-size blocks (64MB)
+  - Write new merged block → update index → delete originals
+  - Compaction is idempotent and crash-safe (write-then-delete)
+
+  ## Block format
+  ```
+  [4 bytes: magic "BLOK"]
+  [4 bytes: header length]
+  [header: JSON-encoded BlockHeader]
+  [data: JSON array of events]
+  ```
+
+  BlockHeader: MinTime, MaxTime, EventCount, Labels, UncompressedSize, Partition
+
+  ## Coding conventions
+  - Follow existing patterns (internal/, cmd/, _test.go)
+  - Compactor runs as a separate process, not inside the ingester
+  - Cache is in-process (no external Redis/memcached)
+  - All new packages get unit tests
+
+dependencies:
+  - PROJECT.md
+  - internal/storage/storage.go
+  - internal/index/index.go
+  - internal/querier/reader.go
+
+plans_dir: docs/compaction/plans
+content_dir: docs/compaction/content
+
+teammates:
+  - role: "compactor-engineer"
+    doc: compactor-engineer.md
+    focus: |
+      Build the background compaction loop:
+
+      1. `internal/compactor/compactor.go`:
+         - `Compactor` struct with ObjectStore, IndexStore, config
+         - `NewCompactor(store ObjectStore, indexStore IndexStore, cfg CompactorConfig) *Compactor`
+         - `Run(ctx context.Context) error` — main loop, runs every CompactionInterval
+         - `CompactTenant(ctx, tenantID, date string) error`:
+           a. Read the block index for the tenant+date
+           b. Identify small blocks (< SmallBlockThreshold, default 4MB)
+           c. Group small blocks by partition
+           d. For each group: read all blocks → merge events → write new block
+              → update index → delete originals
+         - `MergeBlocks(ctx, blocks []BlockMeta) (BlockMeta, error)`:
+           a. Read all blocks from storage
+           b. Concatenate events, sort by timestamp
+           c. Write as a single new block in structured format
+           d. Return the new block metadata
+      2. `internal/compactor/config.go`:
+         - `CompactorConfig`: CompactionInterval (default 5m),
+           SmallBlockThreshold (default 4MB), TargetBlockSize (default 64MB),
+           MaxConcurrency (default 4)
+      3. `cmd/compactor.go`:
+         - Cobra `compactor` subcommand
+         - Flags: --interval, --small-threshold, --target-size, --storage-backend, etc.
+         - Graceful shutdown on SIGINT/SIGTERM
+      4. Unit tests: compaction logic with fake storage, idempotency tests,
+         crash-safety tests (interrupted mid-compaction)
+
+  - role: "block-format-engineer"
+    doc: block-format-engineer.md
+    focus: |
+      Build the structured block format with headers:
+
+      1. `internal/block/format.go`:
+         - `BlockHeader` struct: Magic ([4]byte), Version (uint32), MinTime,
+           MaxTime, EventCount, Labels (map[string][]string), UncompressedSize,
+           Partition, CreatedAt
+         - `WriteBlock(w io.Writer, header BlockHeader, events []Event) error`
+           — writes magic + header length + JSON header + JSON events
+         - `ReadBlockHeader(r io.Reader) (BlockHeader, error)` — reads just the
+           header without deserializing events
+         - `ReadBlock(r io.Reader) (BlockHeader, []Event, error)` — reads the
+           full block (header + events)
+         - Magic bytes: "BLOK" (0x424C4F4B)
+      2. `internal/block/builder.go`:
+         - `BlockBuilder` struct for incrementally building blocks
+         - `NewBlockBuilder(tenantID string, partition int32) *BlockBuilder`
+         - `Add(event Event)` — add event, update header stats
+         - `Build() (BlockHeader, []byte, error)` — finalize and serialize
+      3. Update ingester flusher to write in structured block format instead
+         of raw JSON arrays
+      4. Update querier block reader to read both formats (backwards compatible
+         with existing raw JSON blocks)
+      5. Unit tests: round-trip serialize/deserialize, header-only reads,
+         backwards compatibility
+
+  - role: "cache-engineer"
+    doc: cache-engineer.md
+    focus: |
+      Build the LRU block cache for read performance:
+
+      1. `internal/cache/lru.go`:
+         - `LRUCache` struct: generic LRU cache with configurable max size (bytes)
+         - `NewLRUCache(maxBytes int64) *LRUCache`
+         - `Get(key string) ([]byte, bool)` — get cached block, returns hit/miss
+         - `Put(key string, value []byte)` — cache block, evict LRU if over size
+         - `Evict(key string)` — remove specific entry
+         - `Stats() CacheStats` — hits, misses, evictions, current size
+         - Thread-safe (sync.Mutex)
+      2. `internal/cache/cached_store.go`:
+         - `CachedObjectStore` wrapping ObjectStore with LRU cache
+         - `NewCachedObjectStore(store ObjectStore, cache *LRUCache) *CachedObjectStore`
+         - Implements ObjectStore interface
+         - `Get()`: check cache first → on miss, read from store → cache result
+         - `Put()`: write to store → cache the written data
+         - `Delete()`: delete from store → evict from cache
+      3. Prometheus metrics for cache:
+         - `ingest_cache_hits_total`, `ingest_cache_misses_total`
+         - `ingest_cache_evictions_total`, `ingest_cache_size_bytes`
+      4. Wire into querier: wrap the object store with CachedObjectStore
+      5. Unit tests: LRU eviction ordering, size-based eviction, cache hit/miss,
+         concurrent access, metrics accuracy

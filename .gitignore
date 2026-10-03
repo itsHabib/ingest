@@ -1,0 +1,19 @@
+# Compiled binary
+ingestion-engine
+
+# Binary profiles from pprof (large, machine-specific)
+profiles/*.pb.gz
+
+# Benchmark result files (machine-specific)
+benchmarks/*.txt
+benchmarks/*.json
+
+# Local builds and runtime data
+bin/
+data/
+.env
+.env.*
+*.pem
+*.key
+credentials*
+secrets/

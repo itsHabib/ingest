@@ -1,0 +1,148 @@
+phase: "Query Foundation"
+
+goal: >
+  HTTP query API, block index for fast lookups, and parallel block reading with
+  filtering. This phase adds the read path — clients can query stored events by
+  time range, tenant, and label matchers without scanning every block.
+
+system_context: |
+  ## What we're building
+  The ingestion pipeline (Phases 1-5) writes events through Gateway → Kafka →
+  Ingester → Object Storage as JSON batch files. The current storage format is:
+  `<tenantID>/<YYYY-MM-DD>/<partition>-<offset>.json`
+
+  The problem: there is no read path. To answer any query, you'd have to list
+  every file for a tenant, read them all, deserialize, and filter in memory.
+  This is O(all data) for every query — completely unusable at scale.
+
+  ## The solution (this phase)
+  1. **Block Index** — A lightweight index (one per tenant per day) that maps
+     time ranges and label sets to block file paths. Written by the ingester at
+     flush time. Enables the querier to skip blocks that can't contain matching
+     events.
+  2. **Query API** — HTTP endpoint `GET /api/v1/query` that accepts time range,
+     tenant ID, and label matchers. Returns matching events as a JSON stream.
+  3. **Parallel Block Reader** — Reads matching blocks concurrently (bounded
+     goroutine pool), applies label filters, and merges results in time order.
+
+  ## Architecture
+  ```
+  Client → GET /api/v1/query → Querier
+                                  ├─ Read block index
+                                  ├─ Filter to matching blocks
+                                  └─ Parallel read + filter + merge
+                                      └─ Object Storage
+  ```
+
+  ## Key design decisions
+  - Block index is a simple JSON file per tenant per day (not a database)
+  - Index is written by the ingester alongside each batch flush
+  - Querier is a new CLI command (`go run . querier --port 8082`)
+  - Label matching uses exact match and regex (same as Prometheus matchers)
+  - Results are streamed as newline-delimited JSON for memory efficiency
+  - Concurrency is bounded by a configurable worker pool (default: 8)
+
+  ## Query API
+  ```
+  GET /api/v1/query?start=2024-01-01T00:00:00Z&end=2024-01-02T00:00:00Z
+  X-Scope-OrgID: tenant-a
+  Labels: service=api,env=prod
+
+  200 → newline-delimited JSON events
+  400 → invalid query parameters
+  404 → no matching data
+  ```
+
+  ## Coding conventions
+  - Follow the same patterns as existing packages (internal/, cmd/, _test.go)
+  - Use context.Context throughout for cancellation
+  - Errors wrap with fmt.Errorf("thing: %w", err)
+  - All new packages get unit tests
+
+dependencies:
+  - PROJECT.md
+  - internal/storage/storage.go
+  - internal/event/event.go
+
+plans_dir: docs/query-foundation/plans
+content_dir: docs/query-foundation/content
+
+teammates:
+  - role: "index-engineer"
+    doc: index-engineer.md
+    focus: |
+      Build the block index for fast query lookups:
+
+      1. `internal/index/index.go`:
+         - `BlockMeta` struct: FilePath, TenantID, Partition, MinTime, MaxTime,
+           EventCount, Labels (set of label keys present), SizeBytes
+         - `Index` struct: TenantID, Date, Blocks []BlockMeta
+         - `NewIndex(tenantID, date string) *Index`
+         - `AddBlock(meta BlockMeta)` — append block metadata
+         - `Lookup(start, end time.Time, matchers []LabelMatcher) []BlockMeta`
+           — return blocks whose time range overlaps [start, end] and whose
+           labels could match the matchers
+      2. `internal/index/store.go`:
+         - `IndexStore` interface for reading/writing indexes
+         - `ObjectStoreIndexStore` implementation using the existing ObjectStore
+         - Index key format: `<tenantID>/<date>/index.json`
+         - `WriteIndex(ctx, index) error` — serialize and write
+         - `ReadIndex(ctx, tenantID, date) (*Index, error)` — read and parse
+      3. `internal/index/matcher.go`:
+         - `LabelMatcher` struct: Name, Value, Type (exact, regex, not-equal, not-regex)
+         - `ParseMatchers(query string) ([]LabelMatcher, error)` — parse
+           `service=api,env=~prod.*` style query strings
+         - `Match(labels map[string]string) bool` — check if labels match
+      4. Integration with ingester: update the flusher to write block metadata
+         to the index after each successful batch flush
+      5. Unit tests for index, matchers, and store
+
+  - role: "query-api-engineer"
+    doc: query-api-engineer.md
+    focus: |
+      Build the HTTP query endpoint and querier CLI command:
+
+      1. `internal/querier/handler.go`:
+         - `Handler` struct with IndexStore, ObjectStore, and config
+         - `NewHandler(indexStore, objectStore, cfg) *Handler`
+         - `ServeHTTP(w, r)` for `GET /api/v1/query`:
+           a. Extract tenant ID from X-Scope-OrgID header
+           b. Parse query params: start, end (RFC3339), labels (comma-separated matchers)
+           c. Validate: start < end, valid matchers, tenant not empty
+           d. Enumerate dates in [start, end] range
+           e. For each date, read the index and lookup matching blocks
+           f. Pass matching block paths to the block reader
+           g. Stream results as newline-delimited JSON
+         - Health endpoint: `GET /ready` returns 200
+      2. `cmd/querier.go`:
+         - Cobra `querier` subcommand
+         - Flags: --port (default 8082), --admin-port (default 9102),
+           --storage-backend, --storage-path, --s3-* flags
+         - Wires up config → index store → object store → handler → http.Server
+         - Graceful shutdown on SIGINT/SIGTERM
+      3. Unit tests with httptest for handler (mock index store, mock object store)
+
+  - role: "block-reader-engineer"
+    doc: block-reader-engineer.md
+    focus: |
+      Build parallel block reading with filtering and merge:
+
+      1. `internal/querier/reader.go`:
+         - `BlockReader` struct with ObjectStore, concurrency config
+         - `NewBlockReader(store ObjectStore, workers int) *BlockReader`
+         - `ReadBlocks(ctx context.Context, paths []string, matchers []LabelMatcher) (<-chan Event, <-chan error)`
+           — reads blocks in parallel using a worker pool, applies label
+           filters, sends matching events to the output channel
+         - Worker pool: bounded goroutines (default 8), context-aware cancellation
+         - Each worker: read block from storage → deserialize → filter by matchers → send to channel
+      2. `internal/querier/merge.go`:
+         - `MergeStreams(streams ...<-chan Event) <-chan Event`
+           — k-way merge of event streams ordered by timestamp
+         - Uses a min-heap for efficient O(N log K) merge
+      3. `internal/querier/writer.go`:
+         - `StreamJSON(w http.ResponseWriter, events <-chan Event) error`
+           — writes events as newline-delimited JSON, flushes periodically
+         - Sets proper headers: Content-Type: application/x-ndjson
+         - Handles context cancellation (client disconnect)
+      4. Unit tests: parallel reader with mock storage, merge ordering,
+         streaming writer

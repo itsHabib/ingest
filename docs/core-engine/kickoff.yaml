@@ -1,0 +1,197 @@
+phase: "Core Engine"
+
+goal: >
+  Build the consistent hash ring for partition routing, the ObjectStore interface
+  with filesystem backend, and the stateless ingester that consumes from Kafka,
+  batches events, and flushes to storage.
+
+system_context: |
+  ## What we're building
+  The core distributed systems engine for the ingestion pipeline. Phase 1 gave us
+  a gateway that produces to Kafka. This phase adds:
+  1. A consistent hash ring that deterministically routes tenant data to Kafka partitions
+  2. An ObjectStore abstraction with a local filesystem implementation
+  3. A stateless ingester that consumes from Kafka, batches in memory, and flushes to storage
+
+  ## Architecture
+  ```
+  Client → Gateway (HTTP) → [Hash Ring] → Kafka → Ingester → [Batcher] → [Flusher] → ObjectStore (filesystem)
+  ```
+
+  ## Existing code from Phase 1
+  - `internal/model/event.go` — Event and Batch types with JSON serialization
+  - `internal/tenant/tenant.go` — tenant ID extraction and context helpers
+  - `internal/gateway/handler.go` — HTTP handler that validates and produces to Kafka
+  - `internal/gateway/producer.go` — franz-go producer wrapper
+  - `internal/config/config.go` — centralized config
+  - `cmd/root.go`, `cmd/gateway.go` — cobra CLI
+
+  ## Hash Ring Design (BUILD FROM SCRATCH)
+  The ring must be hand-built, not imported — this ensures deep understanding of consistent hashing.
+  - Use `github.com/cespare/xxhash/v2` for hashing (fast, non-cryptographic)
+  - Virtual nodes: generate N tokens per partition using `xxhash("partition-P-vnode-V")`
+  - Sort all tokens in a slice
+  - Lookup: hash the key, binary search for first token >= hash, return its partition
+  - ~80-100 lines of code. Must be whiteboardable.
+  - Default: 6 partitions, 64 virtual nodes per partition
+
+  ## Storage Key Format
+  Objects are stored with tenant-isolated keys:
+  ```
+  <tenantID>/<date-YYYY-MM-DD>/<partition>-<offset>.json
+  ```
+  Example: `tenant-a/2026-02-28/3-00000042.json`
+
+  ## Ingester Design
+  The ingester is STATELESS — this is the key architectural insight. Kafka owns durability.
+  - Consumer group: `ingestion-consumers` (franz-go consumer group)
+  - Each ingester instance consumes some partitions (Kafka rebalances automatically)
+  - Events are routed to a Batcher keyed by `tenantID:partition`
+  - Batcher flushes when: batch size >= 1000 events OR batch age >= 10s
+  - Flusher writes batch to ObjectStore, then commits Kafka offset
+  - CRITICAL: commit AFTER flush (at-least-once semantics). Never commit before flush.
+  - Graceful shutdown: stop consuming → flush all pending batches → commit → exit
+
+  ## Coding conventions (same as Phase 1)
+  - Use `context.Context` throughout
+  - Errors wrap with `fmt.Errorf("thing: %w", err)`
+  - All packages get unit tests
+  - `log/slog` for structured logging
+
+dependencies:
+  - PROJECT.md
+  - docs/foundation/kickoff.yaml
+
+plans_dir: docs/core-engine/plans
+content_dir: docs/core-engine/content
+
+teammates:
+  - role: "ring-engineer"
+    doc: ring-engineer.md
+    focus: |
+      Build a consistent hash ring from scratch and integrate it into the gateway.
+
+      1. `internal/ring/hashring.go`:
+         - `Ring` struct with fields: partitions (int), tokens ([]uint32 sorted), owners ([]int32)
+         - `NewRing(partitions int, virtualNodesPerPartition int) *Ring`:
+           a. For each partition 0..N-1, generate virtualNodesPerPartition tokens
+           b. Token = uint32(xxhash.Sum64String(fmt.Sprintf("partition-%d-vnode-%d", p, v)))
+           c. Store (token, partitionID) pairs
+           d. Sort by token value
+         - `GetPartition(key string) int32`:
+           a. Hash the key: uint32(xxhash.Sum64String(key))
+           b. Binary search (sort.Search) for first token >= hash
+           c. Wrap around if past the end (ring topology)
+           d. Return the owning partition ID
+         - `GetPartitionForTenant(tenantID string, labels map[string]string) int32`:
+           a. Build key: tenantID + ":" + sorted label pairs
+           b. Call GetPartition(key)
+
+      2. `internal/ring/hashring_test.go`:
+         - Test determinism: same key always returns same partition
+         - Test distribution: 10,000 random keys across 6 partitions, each gets 10-25% (not wildly unbalanced)
+         - Test minimal disruption: changing from 6 to 7 partitions moves roughly 1/7 of keys
+         - Test wrap-around: keys that hash above the max token still resolve
+         - Test empty ring edge case
+
+      3. Integrate into gateway:
+         - Update `internal/gateway/handler.go` to accept a `*ring.Ring`
+         - Use `ring.GetPartitionForTenant()` to determine partition when producing to Kafka
+         - Pass explicit partition to franz-go producer (use `kgo.RecordPartition()`)
+
+  - role: "storage-engineer"
+    doc: storage-engineer.md
+    focus: |
+      Build the ObjectStore interface and filesystem implementation.
+
+      1. `internal/storage/storage.go`:
+         - `ObjectStore` interface:
+           ```go
+           type ObjectStore interface {
+               Put(ctx context.Context, key string, data []byte) error
+               Get(ctx context.Context, key string) ([]byte, error)
+               List(ctx context.Context, prefix string) ([]string, error)
+               Delete(ctx context.Context, key string) error
+               Exists(ctx context.Context, key string) (bool, error)
+           }
+           ```
+         - Key format helper: `BatchKey(tenantID string, date time.Time, partition int32, offset int64) string`
+           Returns: `<tenantID>/<YYYY-MM-DD>/<partition>-<offset padded to 10 digits>.json`
+
+      2. `internal/storage/filesystem.go`:
+         - `FilesystemStore` struct with baseDir string
+         - `NewFilesystemStore(baseDir string) (*FilesystemStore, error)` — creates baseDir if needed
+         - `Put`: creates intermediate directories with os.MkdirAll, writes atomically (write to temp, rename)
+         - `Get`: reads file, returns os.ErrNotExist wrapped error if missing
+         - `List`: walks directory tree under prefix, returns relative keys
+         - `Delete`: removes file
+         - `Exists`: os.Stat check
+         - Atomic writes prevent partial files on crash
+
+      3. `internal/storage/filesystem_test.go`:
+         - Test Put/Get roundtrip
+         - Test List with prefix filtering
+         - Test Delete
+         - Test tenant isolation (tenant-a can't see tenant-b's data)
+         - Test concurrent writes (goroutines writing different keys)
+         - Use t.TempDir() for test isolation
+
+  - role: "ingester-engineer"
+    doc: ingester-engineer.md
+    focus: |
+      Build the stateless Kafka consumer, in-memory batcher, and storage flusher.
+
+      1. `internal/ingester/batcher.go`:
+         - `Batcher` struct:
+           - maxSize int (default 1000 events)
+           - maxAge time.Duration (default 10s)
+           - pending map[string]*model.Batch (key: "tenantID:partition")
+           - flushCh chan *model.Batch (buffered, size 100)
+           - mu sync.Mutex
+         - `NewBatcher(maxSize int, maxAge time.Duration) *Batcher`
+         - `Add(event model.Event, partition int32)`:
+           a. Lock, get or create pending batch for key
+           b. Append event to batch
+           c. If batch.Len() >= maxSize, remove from pending, send to flushCh
+           d. Unlock
+         - `Start(ctx context.Context)`: background goroutine that ticks every second,
+           checks for batches older than maxAge, flushes them
+         - `FlushAll()`: flush everything remaining (called during shutdown)
+         - `FlushChan() <-chan *model.Batch`: returns the flush channel
+
+      2. `internal/ingester/flusher.go`:
+         - `Flusher` struct with ObjectStore and slog.Logger
+         - `NewFlusher(store storage.ObjectStore) *Flusher`
+         - `Flush(ctx context.Context, batch *model.Batch) error`:
+           a. Serialize batch to JSON via model.MarshalBatch
+           b. Generate storage key via storage.BatchKey
+           c. Call store.Put
+           d. Log: tenant, partition, event count, size bytes, duration
+           e. Return error (caller handles retry)
+         - Simple retry wrapper: `FlushWithRetry(ctx, batch, maxRetries int) error`
+           - Exponential backoff: 100ms, 200ms, 400ms
+           - Return last error if all retries fail
+
+      3. `internal/ingester/consumer.go`:
+         - `Consumer` struct with franz-go client, batcher, flusher, logger
+         - `NewConsumer(cfg config.IngesterConfig, batcher *Batcher, flusher *Flusher) (*Consumer, error)`
+         - `Run(ctx context.Context) error`:
+           a. Start batcher background goroutine
+           b. Start N flush workers (goroutines reading from flushCh, default 4)
+           c. Main loop: poll Kafka, deserialize events, route to batcher
+           d. On flush: flusher.FlushWithRetry, then commit offset
+           e. On ctx.Done(): stop polling, batcher.FlushAll(), flush remaining, return
+         - Use franz-go consumer group: group `ingestion-consumers`, topic `ingestion-events`
+         - Manual offset commit (disable auto-commit) — commit AFTER successful flush only
+
+      4. `cmd/ingester.go`:
+         - Cobra `ingester` subcommand
+         - Flags: --kafka-brokers, --kafka-topic, --consumer-group, --batch-size,
+           --batch-age, --storage-path, --flush-workers
+         - Wires up: config → storage → flusher → batcher → consumer
+         - Graceful shutdown on SIGINT/SIGTERM
+
+      5. Unit tests:
+         - `batcher_test.go`: test size-triggered flush, time-triggered flush, FlushAll
+         - `flusher_test.go`: test successful flush, test retry on error (mock ObjectStore)
+         - `consumer_test.go`: basic wiring test (mock kafka client if feasible, otherwise integration-only)

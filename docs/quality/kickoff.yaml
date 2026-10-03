@@ -1,0 +1,219 @@
+phase: "Quality Engineering"
+
+goal: >
+  Comprehensive test coverage — unit tests for all packages, end-to-end integration
+  tests with Docker, and chaos/failure mode tests that verify recovery behavior.
+
+system_context: |
+  ## What we're building
+  A thorough test suite for the ingestion engine. After Phases 1-3, we have a fully
+  functional multi-tenant ingestion pipeline with rate limiting, metrics, and multiple
+  storage backends. This phase ensures it actually works correctly under real conditions.
+
+  ## Why this matters
+  Testing strategy, failure modes, and system resilience are critical for production
+  distributed systems. Chaos tests that kill ingesters mid-flush and verify at-least-once
+  delivery demonstrate production-level thinking.
+
+  ## Architecture recap
+  ```
+  LoadGen → Gateway (rate limit, hash ring) → Kafka → Ingester (batch, flush) → ObjectStore (fs/S3)
+  ```
+
+  ## Existing code from Phases 1-3
+  - Full pipeline: gateway, hash ring, Kafka producer/consumer, batcher, flusher
+  - ObjectStore interface with filesystem and S3 implementations
+  - Per-tenant rate limiter, backpressure (pause/resume consumption)
+  - Prometheus metrics on all components
+  - Load generator
+  - Docker Compose with Kafka, MinIO, Prometheus, Grafana
+
+  ## Testing strategy
+  Three tiers:
+  1. **Unit tests** — fast, no external deps, test each package in isolation with mocks/fakes
+  2. **Integration tests** — require Docker (Kafka + MinIO), test the full pipeline end-to-end
+  3. **Chaos tests** — deliberately break things, verify recovery and data integrity
+
+  ## Test conventions
+  - Use `testing.T` and subtests (`t.Run`)
+  - Table-driven tests where applicable
+  - Use `t.TempDir()` for filesystem isolation
+  - Use `t.Parallel()` where safe
+  - Use build tags for integration/chaos tests: `//go:build integration` / `//go:build chaos`
+  - Mocks/fakes live in `internal/testing/` — prefer fakes (real implementations with in-memory state) over mocks
+
+  ## Key invariants to test
+  1. At-least-once: every event sent to the gateway appears in storage (possibly duplicated, never lost)
+  2. Tenant isolation: tenant-a's data never appears in tenant-b's storage path
+  3. Rate limiting: exceeding rate returns 429, other tenants unaffected
+  4. Crash recovery: kill ingester, restart, no data lost (Kafka replays uncommitted)
+  5. Backpressure: when storage is broken, ingester pauses, gateway eventually returns 503
+
+dependencies:
+  - PROJECT.md
+  - docs/foundation/kickoff.yaml
+  - docs/core-engine/kickoff.yaml
+  - docs/production/kickoff.yaml
+
+plans_dir: docs/quality/plans
+content_dir: docs/quality/content
+
+teammates:
+  - role: "unit-test-engineer"
+    doc: unit-test-engineer.md
+    focus: |
+      Write comprehensive unit tests for all packages, plus shared test utilities.
+
+      1. `internal/testing/fakes.go`:
+         - `FakeObjectStore` — in-memory implementation of storage.ObjectStore:
+           - Uses map[string][]byte internally
+           - Thread-safe with sync.RWMutex
+           - Can be configured to fail: `SetError(err error)` makes all ops return err
+           - Can track calls: `PutCalls() int`, `GetCalls() int`
+         - `FakeProducer` — captures produced messages instead of sending to Kafka:
+           - `Messages() []ProducedMessage` returns all captured messages
+           - `SetError(err error)` makes Produce return error
+
+      2. `internal/gateway/handler_test.go` (expand existing):
+         - Test valid push: correct tenant, valid events → 200 + events produced
+         - Test missing tenant header → 400
+         - Test empty body → 400
+         - Test invalid JSON → 400
+         - Test event validation failures (missing labels, etc.)
+         - Test producer error → 503
+         - Test large batch of events
+         - Test tenant ID is set from header, not from event body
+         - Test /ready endpoint returns 200
+
+      3. `internal/ring/hashring_test.go` (expand existing):
+         - Table-driven tests for partition assignment
+         - Fuzz test: no panics on random input
+         - Benchmark: hash ring lookup should be < 1μs
+
+      4. `internal/ingester/batcher_test.go` (expand existing):
+         - Test size-triggered flush: add maxSize events, verify batch appears on flushCh
+         - Test time-triggered flush: add 1 event, wait maxAge, verify flush
+         - Test FlushAll: add events to multiple batches, FlushAll sends all
+         - Test concurrent Add from multiple goroutines (race detector)
+         - Test batch isolation: events for different tenants go to different batches
+
+      5. `internal/ingester/flusher_test.go` (expand existing):
+         - Test successful flush with FakeObjectStore
+         - Test retry behavior: fail twice, succeed third time
+         - Test all retries exhausted: returns error
+         - Test correct storage key generation
+         - Test batch serialization is correct (deserialize and verify)
+
+      6. `internal/tenant/ratelimit_test.go` (expand existing):
+         - Test concurrent access with race detector
+         - Test limiter cleanup/GC if we have many tenants
+
+      7. `internal/storage/filesystem_test.go` (expand existing):
+         - Test atomic write: concurrent Put to same key doesn't corrupt
+         - Test List ordering
+         - Test deeply nested paths
+         - Test special characters in tenant ID (sanitization)
+
+  - role: "integration-test-engineer"
+    doc: integration-test-engineer.md
+    focus: |
+      Write end-to-end integration tests that exercise the full pipeline with real
+      Kafka and storage.
+
+      1. `internal/testing/harness.go`:
+         - `TestHarness` struct that manages gateway + ingester lifecycle for tests
+         - `NewTestHarness(t *testing.T, opts ...HarnessOption) *TestHarness`:
+           a. Pick random free ports for gateway and admin
+           b. Create temp dir for filesystem storage
+           c. Configure and start gateway in background goroutine
+           d. Configure and start ingester in background goroutine
+           e. Wait for /ready endpoints to respond
+         - `Close()` — graceful shutdown of both components
+         - `GatewayURL() string` — returns the gateway's base URL
+         - `StorageDir() string` — returns the filesystem storage path
+         - Options: WithBatchSize, WithBatchAge, WithFlushWorkers, WithRateLimit
+
+      2. `e2e_test.go` (build tag: `//go:build integration`):
+         - `TestEndToEnd_SingleTenant`:
+           a. Start harness
+           b. Push 100 events for tenant-a
+           c. Wait for batches to flush (poll storage dir)
+           d. Read all flushed batches, deserialize
+           e. Verify all 100 events present (at-least-once: count >= 100)
+           f. Verify all events have tenant_id = "tenant-a"
+
+         - `TestEndToEnd_MultiTenant`:
+           a. Push 100 events each for tenant-a, tenant-b, tenant-c
+           b. Wait for flush
+           c. Verify each tenant's events are in their own storage path
+           d. Verify no cross-tenant data leakage
+
+         - `TestEndToEnd_RateLimit`:
+           a. Configure rate limit to 10 events/sec
+           b. Push 50 events rapidly for tenant-a
+           c. Verify some return 429
+           d. Push 50 events for tenant-b simultaneously — verify all 200
+
+         - `TestEndToEnd_LargeVolume`:
+           a. Push 10,000 events across 5 tenants
+           b. Wait for all batches to flush
+           c. Verify total event count matches
+
+         - `TestEndToEnd_GracefulShutdown`:
+           a. Push events continuously
+           b. Trigger graceful shutdown (send signal to ingester)
+           c. Wait for shutdown to complete
+           d. Verify all events produced before shutdown are flushed
+
+      3. `scripts/e2e.sh`:
+         - Script that runs `docker compose up -d`, waits for Kafka ready,
+           runs `go test -tags integration -v -count=1 ./...`,
+           then `docker compose down`
+         - Exit code from go test propagates
+
+  - role: "chaos-engineer"
+    doc: chaos-engineer.md
+    focus: |
+      Write failure mode tests that deliberately break components and verify
+      the system recovers correctly.
+
+      1. `internal/testing/fault_injector.go`:
+         - `FaultInjector` struct for introducing controlled failures
+         - `BreakStorage(store *FakeObjectStore)` — make all storage ops fail
+         - `HealStorage(store *FakeObjectStore)` — restore storage ops
+         - `SlowStorage(store *FakeObjectStore, delay time.Duration)` — add latency to every op
+         - These work with the FakeObjectStore from unit-test-engineer's fakes.go
+
+      2. `chaos_test.go` (build tag: `//go:build chaos`):
+         - `TestChaos_IngesterCrashRecovery`:
+           a. Start harness, push 500 events
+           b. Kill ingester (harness.StopIngester()) mid-flush
+           c. Restart ingester (harness.StartIngester())
+           d. Wait for flush
+           e. Verify all 500 events are in storage (Kafka replays uncommitted offsets)
+
+         - `TestChaos_StorageFailure_Backpressure`:
+           a. Start harness with FakeObjectStore
+           b. Push events continuously in background
+           c. After 2 seconds, BreakStorage
+           d. Verify ingester logs show consumption paused
+           e. After 5 more seconds, HealStorage
+           f. Verify ingester resumes, events eventually flushed
+           g. Verify no events lost
+
+         - `TestChaos_SlowStorage_BatchAccumulation`:
+           a. Start harness with SlowStorage (500ms per write)
+           b. Push events at high rate
+           c. Verify batches accumulate (larger batch sizes)
+           d. Verify no data loss, just higher latency
+
+         - `TestChaos_MultipleIngesterFailover`:
+           a. Start 2 ingesters in same consumer group
+           b. Push events
+           c. Kill one ingester
+           d. Verify Kafka rebalances partitions to surviving ingester
+           e. Verify no data loss
+
+      3. `scripts/chaos.sh`:
+         - Runs chaos tests with Docker: `go test -tags chaos -v -timeout 120s ./...`
+         - Includes cleanup even if tests fail (trap handler)

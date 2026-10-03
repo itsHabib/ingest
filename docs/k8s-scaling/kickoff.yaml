@@ -1,0 +1,159 @@
+phase: "Scaling & Observability"
+
+goal: >
+  HPA autoscaling with Kafka lag metrics, OpenTelemetry distributed tracing
+  across the full pipeline, and resilience hardening with PDBs, anti-affinity,
+  and network policies.
+
+system_context: |
+  ## What we're building
+  Phase 9 (K8s Foundation) deployed the ingestion engine to Kubernetes with
+  base manifests and Kustomize overlays. This phase adds production-grade
+  scaling, observability, and resilience.
+
+  ## Current state
+  - All services running in K8s with static replica counts
+  - Prometheus metrics exposed on admin ports
+  - Kafka 3-broker cluster with replication
+  - Kustomize overlays for dev/staging/prod
+
+  ## What this phase adds
+  1. **HPA Autoscaling** — Horizontal Pod Autoscalers for gateway (based on
+     CPU/request rate) and ingester (based on Kafka consumer lag). Uses
+     KEDA for Kafka lag-based scaling since vanilla HPA only supports
+     CPU/memory.
+  2. **Distributed Tracing** — OpenTelemetry instrumentation across the full
+     pipeline: gateway → Kafka → ingester → storage. Traces show the complete
+     lifecycle of an event from HTTP push to storage flush. Export to Jaeger
+     or OTLP endpoint.
+  3. **Resilience Hardening** — PodDisruptionBudgets (PDBs) to prevent
+     too many pods going down at once, pod anti-affinity to spread replicas
+     across nodes, and network policies to restrict traffic flow.
+
+  ## Autoscaling strategy
+  - Gateway: HPA on CPU utilization (target 70%) and custom metric
+    (requests/sec via Prometheus adapter)
+  - Ingester: KEDA ScaledObject on Kafka consumer lag
+    (kafka_consumergroup_lag > threshold → scale up)
+  - Querier: HPA on CPU utilization
+  - Compactor: No scaling (single writer by design)
+
+  ## Tracing architecture
+  ```
+  Gateway (span: http.request)
+    └─ Kafka produce (span: kafka.produce)
+         └─ Ingester consume (span: kafka.consume)
+              └─ Batch flush (span: storage.flush)
+  ```
+  - Trace context propagated via Kafka headers (W3C traceparent)
+  - OpenTelemetry SDK with OTLP exporter
+  - Jaeger for local development, any OTLP backend for production
+
+  ## Coding conventions
+  - KEDA manifests in deploy/base/scaling/
+  - OTel instrumentation in internal/observability/tracing.go
+  - Network policies in deploy/base/network/
+  - All manifests validated with dry-run
+
+dependencies:
+  - PROJECT.md
+  - deploy/base/
+  - deploy/overlays/
+  - internal/observability/
+
+plans_dir: docs/k8s-scaling/plans
+content_dir: docs/k8s-scaling/content
+
+teammates:
+  - role: "autoscaling-engineer"
+    doc: autoscaling-engineer.md
+    focus: |
+      Build HPA autoscaling for gateway and ingester:
+
+      1. `deploy/base/scaling/gateway-hpa.yaml`:
+         - HorizontalPodAutoscaler for gateway
+         - Min replicas: 2, Max replicas: 10
+         - Target CPU utilization: 70%
+         - Scale-down stabilization: 300s (prevent flapping)
+      2. `deploy/base/scaling/keda-scaledobject.yaml`:
+         - KEDA ScaledObject for ingester
+         - Trigger: Kafka consumer lag on ingestion-events topic
+         - Min replicas: 3, Max replicas: 20
+         - Lag threshold: 1000 (scale up when lag > 1000 per partition)
+         - Cooldown: 300s
+      3. `deploy/base/scaling/querier-hpa.yaml`:
+         - HorizontalPodAutoscaler for querier
+         - Min replicas: 2, Max replicas: 8
+         - Target CPU utilization: 70%
+      4. `deploy/base/scaling/keda-install.yaml`:
+         - KEDA installation instructions or Helm values
+         - TriggerAuthentication for Kafka connection
+      5. `deploy/base/scaling/prometheus-adapter.yaml`:
+         - Prometheus adapter config for custom metrics (optional, if using
+           custom metrics HPA instead of KEDA for gateway)
+      6. Update Kustomize overlays:
+         - dev: disable HPA (static replicas)
+         - staging: conservative limits (max 5)
+         - prod: full scaling ranges
+      7. Documentation: scaling behavior, tuning guide
+
+  - role: "tracing-engineer"
+    doc: tracing-engineer.md
+    focus: |
+      Add OpenTelemetry distributed tracing:
+
+      1. `internal/observability/tracing.go`:
+         - `InitTracer(serviceName string, cfg TracingConfig) (*sdktrace.TracerProvider, error)`
+         - Configure OTLP exporter (gRPC to collector or Jaeger)
+         - Resource attributes: service.name, service.version, deployment.environment
+         - Sampler: configurable (always_on for dev, probabilistic for prod)
+         - `ShutdownTracer(ctx context.Context) error` — flush and shutdown
+      2. Gateway instrumentation (`internal/gateway/handler.go`):
+         - Start span on HTTP request: "gateway.push"
+         - Add attributes: tenant_id, event_count, partition
+         - Propagate trace context to Kafka via headers (W3C traceparent)
+      3. Ingester instrumentation (`internal/ingester/consumer.go`):
+         - Extract trace context from Kafka headers
+         - Start span: "ingester.consume"
+         - Child span: "ingester.batch" for batching
+         - Child span: "ingester.flush" for storage write
+      4. Querier instrumentation (`internal/querier/handler.go`):
+         - Start span: "querier.query"
+         - Child spans: "querier.plan", "querier.execute", "querier.read_block"
+      5. `deploy/base/tracing/`:
+         - `jaeger.yaml` — Jaeger all-in-one for dev
+         - `otel-collector.yaml` — OpenTelemetry Collector DaemonSet
+         - `otel-configmap.yaml` — Collector config (receivers, processors, exporters)
+      6. Add `go.opentelemetry.io/otel` to go.mod
+      7. Unit tests: trace propagation, span attributes, context extraction
+
+  - role: "resilience-engineer"
+    doc: resilience-engineer.md
+    focus: |
+      Add PDBs, anti-affinity, and network policies:
+
+      1. `deploy/base/resilience/gateway-pdb.yaml`:
+         - PodDisruptionBudget: minAvailable 1 (dev), 2 (prod)
+      2. `deploy/base/resilience/ingester-pdb.yaml`:
+         - PodDisruptionBudget: minAvailable 2 (ensure no data loss during
+           rolling updates — at least 2 consumers always running)
+      3. `deploy/base/resilience/querier-pdb.yaml`:
+         - PodDisruptionBudget: minAvailable 1
+      4. Anti-affinity rules (add to Deployment specs):
+         - `podAntiAffinity.preferredDuringSchedulingIgnoredDuringExecution`
+         - Spread replicas across nodes (topologyKey: kubernetes.io/hostname)
+         - Spread across zones for prod (topologyKey: topology.kubernetes.io/zone)
+      5. `deploy/base/network/`:
+         - `default-deny.yaml` — Default deny all ingress in namespace
+         - `gateway-netpol.yaml` — Allow ingress from LoadBalancer, egress to Kafka
+         - `ingester-netpol.yaml` — Allow ingress from nothing (consumer only),
+           egress to Kafka + storage
+         - `querier-netpol.yaml` — Allow ingress from gateway (or direct),
+           egress to storage
+         - `kafka-netpol.yaml` — Allow ingress from gateway + ingester
+         - `monitoring-netpol.yaml` — Allow Prometheus scraping all admin ports
+      6. Update Kustomize overlays:
+         - dev: no PDBs, no network policies (simpler debugging)
+         - staging: PDBs enabled, network policies enabled
+         - prod: PDBs + anti-affinity + network policies
+      7. Validation: dry-run all manifests, document failure scenarios
